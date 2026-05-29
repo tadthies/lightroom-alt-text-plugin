@@ -1,11 +1,13 @@
 local LrView = import 'LrView'
 local LrPrefs = import 'LrPrefs'
 local LrBinding = import 'LrBinding'
+local LrPathUtils = import 'LrPathUtils'
 
+local config = dofile(LrPathUtils.child(_PLUGIN.path, 'config.lua'))
 local prefs = LrPrefs.prefsForPlugin()
 
 if prefs.metadataField == nil then
-    prefs.metadataField = "caption"
+    prefs.metadataField = config.DEFAULT_METADATA_FIELD
 end
 
 if prefs.skipExisting == nil then
@@ -39,11 +41,7 @@ return {
                     },
                     f:popup_menu {
                         value = bind { key = 'metadataField', object = prefs },
-                        items = {
-                            { title = "Caption", value = "caption" },
-                            { title = "Headline", value = "headline" },
-                            { title = "Title", value = "title" },
-                        },
+                        items = config.METADATA_FIELDS,
                     },
                 },
                 f:row {

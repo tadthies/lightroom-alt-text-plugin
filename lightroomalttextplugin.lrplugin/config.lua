@@ -1,5 +1,13 @@
 return {
-  MODEL = "claude-sonnet-4-5",
+  MODEL = "claude-sonnet-4-6",
+  MAX_TOKENS = 512,
+  ANTHROPIC_VERSION = "2023-06-01",
+  DEFAULT_METADATA_FIELD = "caption",
+  METADATA_FIELDS = {
+    { title = "Caption", value = "caption" },
+    { title = "Headline", value = "headline" },
+    { title = "Title", value = "title" },
+  },
   INSTRUCTIONS = [[
 You are an expert at writing alt text for images for accessibility purposes. Your job is to receive an image and write a short alt text that describes its contents objectively.
 

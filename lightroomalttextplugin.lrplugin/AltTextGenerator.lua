@@ -14,11 +14,32 @@ local LrLogger = import 'LrLogger'
 local logger = LrLogger('AltTextPlugin')
 logger:enable("logfile")
 
-local configPath = LrPathUtils.child(_PLUGIN.path, 'config.lua')
-local config = dofile(configPath)
 local prefs = LrPrefs.prefsForPlugin()
-local dkjsonPath = LrPathUtils.child(_PLUGIN.path, 'dkjson.lua')
-local json = dofile(dkjsonPath)
+
+local function loadModule(fileName)
+    local ok, result = pcall(dofile, LrPathUtils.child(_PLUGIN.path, fileName))
+    if not ok then
+        LrDialogs.message(
+            "Alt Text Generator failed to load.",
+            "Could not load " .. fileName .. ": " .. tostring(result),
+            "critical"
+        )
+        error("Failed to load " .. fileName)
+    end
+    return result
+end
+
+local config = loadModule('config.lua')
+local json = loadModule('dkjson.lua')
+
+local function validateMetadataField(field)
+    for _, item in ipairs(config.METADATA_FIELDS) do
+        if item.value == field then
+            return field
+        end
+    end
+    return config.DEFAULT_METADATA_FIELD
+end
 
 local function sanitizeForLog(str)
     local apiKey = prefs.claudeApiKey
@@ -30,13 +51,18 @@ end
 
 local function resizePhoto(photo, progressScope)
     progressScope:setCaption("Resizing photo...")
-    local tempDir = LrPathUtils.getStandardFilePath('temp')
-    local photoName = LrPathUtils.leafName(photo:getFormattedMetadata('fileName'))
-    local resizedPhotoPath = LrPathUtils.child(tempDir, photoName)
 
-    if LrFileUtils.exists(resizedPhotoPath) then
-        LrFileUtils.delete(resizedPhotoPath)
+    -- Export into a per-photo temp subfolder keyed on the photo's unique local
+    -- identifier, so two selected photos that share a filename can never collide
+    -- and stale files from earlier runs can't make Lightroom append a "-2" suffix.
+    local tempDir = LrPathUtils.child(
+        LrPathUtils.getStandardFilePath('temp'),
+        'alttext-' .. tostring(photo.localIdentifier)
+    )
+    if LrFileUtils.exists(tempDir) then
+        LrFileUtils.delete(tempDir)
     end
+    LrFileUtils.createAllDirectories(tempDir)
 
     local exportSettings = {
         LR_export_destinationType = 'specificFolder',
@@ -89,12 +115,12 @@ local function requestAltTextFromClaude(imageBase64, progressScope)
     local headers = {
         { field = "Content-Type", value = "application/json" },
         { field = "x-api-key", value = prefs.claudeApiKey },
-        { field = "anthropic-version", value = "2023-06-01" },
+        { field = "anthropic-version", value = config.ANTHROPIC_VERSION },
     }
 
     local body = {
         model = config.MODEL,
-        max_tokens = 300,
+        max_tokens = config.MAX_TOKENS,
         system = config.INSTRUCTIONS,
         messages = {
             {
@@ -118,10 +144,17 @@ local function requestAltTextFromClaude(imageBase64, progressScope)
     }
 
     local bodyJson = json.encode(body)
-    local response, _ = LrHttp.post(url, bodyJson, headers)
+    local response, hdrs = LrHttp.post(url, bodyJson, headers)
 
     if not response then
-        return nil, "No response from Claude API"
+        -- On a transport-level failure LrHttp.post returns nil plus an info table
+        -- whose "error" entry describes what went wrong (timeout, bad host, etc.).
+        local detail = "no response"
+        if hdrs and hdrs.error then
+            detail = hdrs.error.name or hdrs.error.errorCode or detail
+        end
+        logger:trace("Claude API request failed: " .. detail)
+        return nil, "Could not reach the Claude API: " .. detail
     end
 
     local ok, decoded = pcall(json.decode, response)
@@ -138,7 +171,10 @@ local function requestAltTextFromClaude(imageBase64, progressScope)
     local content = decoded.content or {}
     for _, block in ipairs(content) do
         if block.type == "text" and block.text then
-            return block.text
+            local trimmed = LrStringUtils.trimWhitespace(block.text)
+            if trimmed ~= "" then
+                return trimmed
+            end
         end
     end
 
@@ -146,31 +182,45 @@ local function requestAltTextFromClaude(imageBase64, progressScope)
     return nil, "Claude returned an unexpected response"
 end
 
-local function generateAltTextForPhoto(photo, progressScope)
-    local metadataField = prefs.metadataField or "caption"
+local function generateAltTextForPhoto(photo, photoName, progressScope)
+    local metadataField = validateMetadataField(prefs.metadataField)
+
+    local function fail(err)
+        logger:trace("Alt text failed for " .. tostring(photoName) .. ": " .. tostring(err))
+        return false, err
+    end
 
     local resizedFilePath = resizePhoto(photo, progressScope)
     if not resizedFilePath then
-        return false, "Failed to resize photo"
+        return fail("Failed to resize photo")
     end
 
     local base64Image = encodePhotoToBase64(resizedFilePath, progressScope)
     LrFileUtils.delete(resizedFilePath)
 
     if not base64Image then
-        return false, "Failed to encode photo"
+        return fail("Failed to encode photo")
     end
 
     local altText, err = requestAltTextFromClaude(base64Image, progressScope)
 
     if altText then
+        -- setRawMetadata is synchronous, so it's safe to pcall (unlike the
+        -- yielding SDK calls above). This keeps a single bad photo — e.g. an
+        -- unwritable field — from aborting the entire batch.
+        local wrote = false
         photo.catalog:withWriteAccessDo("Set Alt Text", function()
-            photo:setRawMetadata(metadataField, altText)
+            wrote = pcall(function()
+                photo:setRawMetadata(metadataField, altText)
+            end)
         end)
-        return true
+        if wrote then
+            return true
+        end
+        return fail("Failed to save alt text")
     end
 
-    return false, err or "Failed to generate alt text"
+    return fail(err or "Failed to generate alt text")
 end
 
 LrTasks.startAsyncTask(function()
@@ -189,7 +239,20 @@ LrTasks.startAsyncTask(function()
             return
         end
 
-        local metadataField = prefs.metadataField or "caption"
+        -- Re-entrancy guard: prevent a second run from starting while one is in
+        -- progress. The flag lives in prefs (each menu click re-runs this file
+        -- fresh, so a local variable wouldn't persist) and is cleared by a cleanup
+        -- handler so it resets even if the task errors or is canceled.
+        if prefs.isRunning then
+            LrDialogs.message("Alt text generation is already running.")
+            return
+        end
+        prefs.isRunning = true
+        context:addCleanupHandler(function()
+            prefs.isRunning = false
+        end)
+
+        local metadataField = validateMetadataField(prefs.metadataField)
         local skipExisting = prefs.skipExisting or false
 
         local progressScope = LrProgressScope({
@@ -220,7 +283,8 @@ LrTasks.startAsyncTask(function()
             if shouldSkip then
                 skipped = skipped + 1
             else
-                local success, err = generateAltTextForPhoto(photo, progressScope)
+                local photoName = photo:getFormattedMetadata('fileName')
+                local success, err = generateAltTextForPhoto(photo, photoName, progressScope)
                 if success then
                     successes = successes + 1
                 else
